@@ -1,0 +1,32 @@
+{
+  "summarization_tasks": {
+    "count": 4,
+    "source_datasets": ["XSum", "PubMedQA", "CUAD", "Amazon Reviews"],
+    "domains": ["news", "biomedical", "legal", "consumer"],
+    "complexity_levels": ["high", "high", "high", "high"],
+    "expected_drift_points": [6, 7, 5, 8],
+    "avg_steps": 20,
+    "total_words_original": [246, 298, 312, 284],
+    "task_focus": [
+      "News analysis and multi-format summarization",
+      "Clinical research interpretation and application",
+      "Legal clause deconstruction and risk assessment",
+      "Review synthesis and buyer decision support"
+    ]
+  },
+  "planning_tasks": {
+    "count": 4,
+    "domains": ["technical", "marketing", "academic", "personal"],
+    "timeframes": ["6-month", "3-month", "12-month", "90-day"],
+    "avg_steps": 20,
+    "complexity_levels": ["high", "high", "high", "high"],
+    "total_steps": [20, 20, 20, 20],
+    "total_estimated_words": [980, 840, 880, 920],
+    "task_focus": [
+      "Phased technical migration with risk mitigation",
+      "Multi-channel product launch campaign",
+      "Structured academic research methodology",
+      "Focused skill acquisition roadmap"
+    ]
+  }
+}
