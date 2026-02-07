@@ -1,0 +1,4 @@
+scope,baseline_mean_ids,intent_mean_ids,intent_wins,total_tasks
+overall,0.5788,0.4179,21,24
+summarization,0.5356,0.4266,9,12
+planning,0.622,0.4092,12,12
