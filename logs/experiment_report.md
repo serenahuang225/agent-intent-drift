@@ -1,6 +1,8 @@
-# Intent Drift Experiment Report
+# Intent Drift Experiment Report (Overall)
 
-Generated: 2026-02-06 05:50:41 UTC
+Generated: 2026-02-08 02:28:22 UTC
+
+Aggregates all models: llama-3.1-8b-instruct, gemma-2-2b-it.
 
 ## Intent Drift Score (IDS)
 
@@ -10,47 +12,37 @@ Generated: 2026-02-06 05:50:41 UTC
 
 ## Summary
 
-| Scope | Baseline mean IDS | Intent mean IDS | Intent wins | Total tasks |
-|-------|-------------------|-----------------|-------------|-------------|
-| overall | 0.5225 | 0.4040 | 15 | 24 |
-| summarization | 0.5697 | 0.3903 | 12 | 12 |
-| planning | 0.4753 | 0.4177 | 3 | 12 |
+| Scope | Baseline mean IDS | Intent mean IDS | Intent wins | Total |
+|-------|-------------------|-----------------|-------------|-------|
+| overall | 0.5666 | 0.4105 | 15 | 16 |
+| summarization | 0.5301 | 0.4135 | 7 | 8 |
+| planning | 0.6031 | 0.4074 | 8 | 8 |
 
-**Intent fusion had lower mean IDS in 15/24 tasks.**
+**Intent fusion had lower mean IDS in 15/16 task-model pairs.**
 
-## Task-Level Comparison
+## Statistical Significance (Overall)
 
-| task_id | task_type | baseline_mean | intent_mean | delta | winner |
-|---------|-----------|---------------|-------------|-------|--------|
-| planning_4_run0 | planning | 0.3855 | 0.3897 | +0.0042 | baseline |
-| planning_4_run1 | planning | 0.3855 | 0.3897 | +0.0042 | baseline |
-| planning_4_run2 | planning | 0.3855 | 0.3897 | +0.0042 | baseline |
-| planning_5_run0 | planning | 0.5787 | 0.6003 | +0.0216 | baseline |
-| planning_5_run1 | planning | 0.5787 | 0.6003 | +0.0216 | baseline |
-| planning_5_run2 | planning | 0.5787 | 0.6003 | +0.0216 | baseline |
-| planning_6_run0 | planning | 0.5603 | 0.2530 | -0.3073 | intent |
-| planning_6_run1 | planning | 0.5603 | 0.2530 | -0.3073 | intent |
-| planning_6_run2 | planning | 0.5603 | 0.2530 | -0.3073 | intent |
-| planning_7_run0 | planning | 0.3769 | 0.4277 | +0.0508 | baseline |
-| planning_7_run1 | planning | 0.3769 | 0.4277 | +0.0508 | baseline |
-| planning_7_run2 | planning | 0.3769 | 0.4277 | +0.0508 | baseline |
-| summarization_0_run0 | summarization | 0.3652 | 0.2676 | -0.0975 | intent |
-| summarization_0_run1 | summarization | 0.3652 | 0.2676 | -0.0975 | intent |
-| summarization_0_run2 | summarization | 0.3652 | 0.2676 | -0.0975 | intent |
-| summarization_1_run0 | summarization | 0.8542 | 0.4750 | -0.3792 | intent |
-| summarization_1_run1 | summarization | 0.8542 | 0.4750 | -0.3792 | intent |
-| summarization_1_run2 | summarization | 0.8542 | 0.4750 | -0.3792 | intent |
-| summarization_2_run0 | summarization | 0.4524 | 0.3095 | -0.1429 | intent |
-| summarization_2_run1 | summarization | 0.4524 | 0.3095 | -0.1429 | intent |
-| summarization_2_run2 | summarization | 0.4524 | 0.3095 | -0.1429 | intent |
-| summarization_3_run0 | summarization | 0.6069 | 0.5090 | -0.0979 | intent |
-| summarization_3_run1 | summarization | 0.6069 | 0.5090 | -0.0979 | intent |
-| summarization_3_run2 | summarization | 0.6069 | 0.5090 | -0.0979 | intent |
+- **Pooled paired tests** (all models × unique tasks, n=16 pairs).
+- **Paired t-test** (H0: mean difference = 0): p = 9.7740e-06.
+- **Wilcoxon signed-rank** (non-parametric): p = 9.1553e-05.
+- **Cohen's d** (paired; negative = intent lower IDS): d = -1.629.
+- Interpret: p < 0.05 suggests the mean IDS difference is unlikely due to chance; |d| ~ 0.2 small, ~0.5 medium, ~0.8+ large.
+
+## Per-Model Reports
+
+- [llama-3.1-8b-instruct](llama-3.1-8b-instruct/experiment_report.md)
+- [gemma-2-2b-it](gemma-2-2b-it/experiment_report.md)
 
 ## Graphs
 
-![IDS by Step](ids_by_step.png)
+![IDS by Model](ids_by_model.png)
 
-![IDS by Task Type](ids_by_task_type.png)
+![IDS by Task Type by Model](ids_by_task_type_by_model.png)
 
-![IDS per Task](ids_per_task.png)
+![IDS by Task Type (averaged)](ids_by_task_type_all_models.png)
+
+![IDS per Task (average across models)](ids_per_task_avg_models.png)
+
+![IDS by Step (all models)](ids_by_step_all_models.png)
+
+![IDS by Step (average across models)](ids_by_step_avg_models.png)

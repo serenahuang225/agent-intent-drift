@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -493,6 +494,135 @@ def interpret_all_models(logs_dir: Path, models: list) -> bool:
     return True
 
 
+def _write_overall_experiment_report(logs_dir: Path, slugs: list):
+    """
+    Write logs/experiment_report.md aggregating all models, with overall p-value.
+    Pools (model, task) pairs for a single paired test across the full experiment.
+    """
+    # Load task-level data from each model; deduplicate by base task (run0/1/2 are identical)
+    pooled_rows = []
+    for slug in slugs:
+        tc_path = logs_dir / slug / "task_comparison.csv"
+        if not tc_path.exists():
+            continue
+        with open(tc_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            seen = set()
+            for row in reader:
+                # Dedupe: one row per (slug, base_task) — drop _runN
+                tid = row.get("task_id", "")
+                base = re.sub(r"_run\d+$", "", tid) if tid else ""
+                key = (slug, base)
+                if key in seen:
+                    continue
+                seen.add(key)
+                pooled_rows.append({
+                    "baseline_mean_ids": float(row.get("baseline_mean_ids", 0)),
+                    "intent_mean_ids": float(row.get("intent_mean_ids", 0)),
+                    "task_type": row.get("task_type", ""),
+                    "task_id": "{} ({})".format(base, slug),
+                })
+
+    if not pooled_rows:
+        return
+
+    # Overall stats from pooled data
+    baseline_vals = [r["baseline_mean_ids"] for r in pooled_rows]
+    intent_vals = [r["intent_mean_ids"] for r in pooled_rows]
+    overall_b = float(np.mean(baseline_vals))
+    overall_i = float(np.mean(intent_vals))
+    intent_wins = sum(1 for r in pooled_rows if r["intent_mean_ids"] < r["baseline_mean_ids"])
+    total = len(pooled_rows)
+
+    # By task type
+    sum_rows = [r for r in pooled_rows if r["task_type"] == "summarization"]
+    plan_rows = [r for r in pooled_rows if r["task_type"] == "planning"]
+    sum_b = float(np.mean([r["baseline_mean_ids"] for r in sum_rows])) if sum_rows else 0
+    sum_i = float(np.mean([r["intent_mean_ids"] for r in sum_rows])) if sum_rows else 0
+    sum_wins = sum(1 for r in sum_rows if r["intent_mean_ids"] < r["baseline_mean_ids"])
+    plan_b = float(np.mean([r["baseline_mean_ids"] for r in plan_rows])) if plan_rows else 0
+    plan_i = float(np.mean([r["intent_mean_ids"] for r in plan_rows])) if plan_rows else 0
+    plan_wins = sum(1 for r in plan_rows if r["intent_mean_ids"] < r["baseline_mean_ids"])
+
+    # Overall paired significance (pooled across models and tasks)
+    sig = _paired_ids_significance(pooled_rows)
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    report_lines = [
+        "# Intent Drift Experiment Report (Overall)",
+        "",
+        "Generated: {}".format(ts),
+        "",
+        "Aggregates all models: {}.".format(", ".join(slugs)),
+        "",
+        "## Intent Drift Score (IDS)",
+        "",
+        "- **0** = aligned with initial intent",
+        "- **1** = maximum semantic drift",
+        "- Lower is better.",
+        "",
+        "## Summary",
+        "",
+        "| Scope | Baseline mean IDS | Intent mean IDS | Intent wins | Total |",
+        "|-------|-------------------|-----------------|-------------|-------|",
+        "| overall | {:.4f} | {:.4f} | {} | {} |".format(overall_b, overall_i, intent_wins, total),
+    ]
+    if sum_rows:
+        report_lines.append("| summarization | {:.4f} | {:.4f} | {} | {} |".format(sum_b, sum_i, sum_wins, len(sum_rows)))
+    if plan_rows:
+        report_lines.append("| planning | {:.4f} | {:.4f} | {} | {} |".format(plan_b, plan_i, plan_wins, len(plan_rows)))
+
+    report_lines.extend([
+        "",
+        "**Intent fusion had lower mean IDS in {}/{} task-model pairs.**".format(intent_wins, total),
+        "",
+        "## Statistical Significance (Overall)",
+        "",
+    ])
+    if "error" in sig:
+        report_lines.append("- Could not compute (scipy not installed).")
+    else:
+        report_lines.append("- **Pooled paired tests** (all models × unique tasks, n={} pairs).".format(sig["n"]))
+        if sig.get("p_ttest") is not None:
+            report_lines.append("- **Paired t-test** (H0: mean difference = 0): p = {:.4e}.".format(sig["p_ttest"]))
+        if sig.get("p_wilcoxon") is not None:
+            report_lines.append("- **Wilcoxon signed-rank** (non-parametric): p = {:.4e}.".format(sig["p_wilcoxon"]))
+        if sig.get("cohens_d") is not None:
+            report_lines.append("- **Cohen's d** (paired; negative = intent lower IDS): d = {:.3f}.".format(sig["cohens_d"]))
+        report_lines.append("- Interpret: p < 0.05 suggests the mean IDS difference is unlikely due to chance; |d| ~ 0.2 small, ~0.5 medium, ~0.8+ large.")
+
+    report_lines.extend([
+        "",
+        "## Per-Model Reports",
+        "",
+    ])
+    for slug in slugs:
+        sub_report = slug + "/experiment_report.md"
+        report_lines.append("- [{}]({})".format(slug, sub_report))
+    report_lines.append("")
+    report_lines.extend([
+        "## Graphs",
+        "",
+        "![IDS by Model](ids_by_model.png)",
+        "",
+        "![IDS by Task Type by Model](ids_by_task_type_by_model.png)",
+        "",
+        "![IDS by Task Type (averaged)](ids_by_task_type_all_models.png)",
+        "",
+        "![IDS per Task (average across models)](ids_per_task_avg_models.png)",
+        "",
+        "![IDS by Step (all models)](ids_by_step_all_models.png)",
+        "",
+        "![IDS by Step (average across models)](ids_by_step_avg_models.png)",
+        "",
+    ])
+
+    (logs_dir / "experiment_report.md").write_text("\n".join(report_lines), encoding="utf-8")
+    print("  Overall report: logs/experiment_report.md (p = {})".format(
+        "{:.4e}".format(sig["p_ttest"]) if sig.get("p_ttest") is not None else "N/A"
+    ))
+
+
 def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
     """Write ids_by_model.png and ids_by_step_all_models.png to logs_dir."""
     import matplotlib
@@ -556,13 +686,162 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
     fig.savefig(logs_dir / "ids_by_step_avg_models.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+    # ids_by_task_type_by_model.png: summarization vs planning, baseline vs intent, models kept separate (no averaging)
+    slugs = [r[0] for r in per_model_results]
+    model_sum = {}  # slug -> (sum_b, sum_i)
+    model_plan = {}  # slug -> (plan_b, plan_i)
+    for slug in slugs:
+        ss_path = logs_dir / slug / "summary_stats.csv"
+        if not ss_path.exists():
+            continue
+        with open(ss_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                scope = row.get("scope", "")
+                if scope == "summarization":
+                    model_sum[slug] = (float(row.get("baseline_mean_ids", 0)), float(row.get("intent_mean_ids", 0)))
+                elif scope == "planning":
+                    model_plan[slug] = (float(row.get("baseline_mean_ids", 0)), float(row.get("intent_mean_ids", 0)))
+    if model_sum or model_plan:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+        for idx, (task_type, data) in enumerate([("summarization", model_sum), ("planning", model_plan)]):
+            if not data:
+                continue
+            ax = axes[idx]
+            model_slugs = list(data.keys())
+            x_pos = np.arange(len(model_slugs))
+            width = 0.35
+            b_vals = [data[s][0] for s in model_slugs]
+            i_vals = [data[s][1] for s in model_slugs]
+            ax.bar(x_pos - width / 2, b_vals, width, label="Baseline")
+            ax.bar(x_pos + width / 2, i_vals, width, label="Intent fusion")
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(model_slugs, rotation=45, ha="right")
+            ax.set_ylabel("Mean IDS")
+            ax.set_title("{}".format(task_type.capitalize()))
+            ax.legend()
+            ax.set_ylim(0, 1.05)
+            ax.grid(True, alpha=0.3, axis="y")
+        if not model_sum:
+            axes[0].axis("off")
+        if not model_plan:
+            axes[1].axis("off")
+        fig.suptitle("Mean IDS by Task Type and Model (baseline vs intent)")
+        fig.tight_layout()
+        fig.savefig(logs_dir / "ids_by_task_type_by_model.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+    # ids_by_task_type_all_models.png: mean IDS by task type, averaged across all models
+    sum_b_vals, sum_i_vals, plan_b_vals, plan_i_vals = [], [], [], []
+    for slug in slugs:
+        ss_path = logs_dir / slug / "summary_stats.csv"
+        if not ss_path.exists():
+            continue
+        with open(ss_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                scope = row.get("scope", "")
+                if scope == "summarization":
+                    sum_b_vals.append(float(row.get("baseline_mean_ids", 0)))
+                    sum_i_vals.append(float(row.get("intent_mean_ids", 0)))
+                elif scope == "planning":
+                    plan_b_vals.append(float(row.get("baseline_mean_ids", 0)))
+                    plan_i_vals.append(float(row.get("intent_mean_ids", 0)))
+    types_vals = []
+    if sum_b_vals:
+        types_vals.append(("summarization", np.mean(sum_b_vals), np.mean(sum_i_vals)))
+    if plan_b_vals:
+        types_vals.append(("planning", np.mean(plan_b_vals), np.mean(plan_i_vals)))
+    if types_vals:
+        labels = [t[0] for t in types_vals]
+        b_vals = [t[1] for t in types_vals]
+        i_vals = [t[2] for t in types_vals]
+        x_pos = np.arange(len(labels))
+        width = 0.35
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.bar(x_pos - width / 2, b_vals, width, label="Baseline")
+        ax.bar(x_pos + width / 2, i_vals, width, label="Intent fusion")
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("Mean IDS")
+        ax.set_title("Mean IDS by Task Type (average across all models)")
+        ax.legend()
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3, axis="y")
+        fig.tight_layout()
+        fig.savefig(logs_dir / "ids_by_task_type_all_models.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+    # ids_per_task_avg_models.png: mean IDS per task (summarization_0, 1, 2, 3, planning_4, ...), averaged across all models
+    # Collect per-task data from each model's task_comparison.csv; dedupe by base task; average across models
+    task_to_b = {}  # base_task -> [baseline_mean_ids from each model]
+    task_to_i = {}
+    task_to_type = {}
+    for slug in slugs:
+        tc_path = logs_dir / slug / "task_comparison.csv"
+        if not tc_path.exists():
+            continue
+        seen = set()
+        with open(tc_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tid = row.get("task_id", "")
+                base = re.sub(r"_run\d+$", "", tid) if tid else ""
+                if (slug, base) in seen:
+                    continue
+                seen.add((slug, base))
+                if base not in task_to_b:
+                    task_to_b[base] = []
+                    task_to_i[base] = []
+                    task_to_type[base] = row.get("task_type", "")
+                task_to_b[base].append(float(row.get("baseline_mean_ids", 0)))
+                task_to_i[base].append(float(row.get("intent_mean_ids", 0)))
+    # Build rows: (base_task, task_type, mean_b, mean_i), grouped by task_type for subplots
+    per_task_avg = []
+    for base in sorted(task_to_b.keys(), key=lambda x: (task_to_type.get(x, ""), x)):
+        per_task_avg.append({
+            "task_id": base,
+            "task_type": task_to_type.get(base, ""),
+            "baseline_mean": np.mean(task_to_b[base]),
+            "intent_mean": np.mean(task_to_i[base]),
+        })
+    if per_task_avg:
+        sum_avg = [r for r in per_task_avg if r["task_type"] == "summarization"]
+        plan_avg = [r for r in per_task_avg if r["task_type"] == "planning"]
+        type_rows = [(t, r) for t, r in [("summarization", sum_avg), ("planning", plan_avg)] if r]
+        n_plots = len(type_rows)
+        fig, axes = plt.subplots(n_plots, 1, figsize=(10, 4 * n_plots), sharex=False)
+        if n_plots == 1:
+            axes = [axes]
+        for idx, (task_type, rows) in enumerate(type_rows):
+            ax = axes[idx]
+            labels = [r["task_id"] for r in rows]
+            x_pos = np.arange(len(labels))
+            width = 0.35
+            ax.bar(x_pos - width / 2, [r["baseline_mean"] for r in rows], width, label="Baseline")
+            ax.bar(x_pos + width / 2, [r["intent_mean"] for r in rows], width, label="Intent fusion")
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(labels, rotation=45, ha="right")
+            ax.set_ylabel("Mean IDS")
+            ax.set_title("Mean IDS per Task ({}) — average across all models".format(task_type))
+            ax.legend()
+            ax.set_ylim(0, 1.05)
+            ax.grid(True, alpha=0.3, axis="y")
+        fig.tight_layout()
+        fig.savefig(logs_dir / "ids_per_task_avg_models.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
     # Optional: cross_model_summary.csv
     with open(logs_dir / "cross_model_summary.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["model_slug", "baseline_mean_ids", "intent_mean_ids", "intent_wins", "total_tasks"])
         for r in per_model_results:
             w.writerow([r[0], round(r[1], 4), round(r[2], 4), r[3], r[4]])
-    print("  Cross-model: ids_by_model.png, ids_by_step_all_models.png, ids_by_step_avg_models.png, cross_model_summary.csv")
+
+    # Overall experiment report (aggregates all models, includes overall p-value)
+    slugs = [r[0] for r in per_model_results]
+    _write_overall_experiment_report(logs_dir, slugs)
+    print("  Cross-model: ids_by_model.png, ids_by_task_type_by_model.png, ids_by_task_type_all_models.png, ids_per_task_avg_models.png, ids_by_step_all_models.png, ids_by_step_avg_models.png, cross_model_summary.csv")
 
 
 def main(models_override: list = None):
