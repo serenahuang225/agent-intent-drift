@@ -2,11 +2,17 @@
 Repeatable experiment: same model, seed, temperature, tasks.
 Run baseline agent then intent fusion agent; store logs separately.
 
+Run a single model:
+  python run_experiment.py --model meta-llama/Llama-3.1-8B-Instruct
+  python run_experiment.py --model google/gemma-2-2b-it
+
 How to interpret results:
-- IDS (Intent Drift Score): 0 = aligned with initial intent, 1 = maximum drift. Lower is better.
+- IDS (Intent Drift Score): per-step divergence from current inferred goal. Lower is better.
+- Goal shift: task-level cumulative goal shift (initial vs final intent). Lower is better.
 - After a run, interpretation generates: CSV tables, PNG graphs, and experiment_report.md in logs/
 - To re-run interpretation only (without re-running the experiment):
   python run_experiment.py --interpret-only
+- Use --legacy for old logs that only have ids (no intent_replay; IDS will be skipped or warned).
 """
 import argparse
 import csv
@@ -105,16 +111,54 @@ def _task_type(task_id: str) -> str:
     return "unknown"
 
 
-def _task_metrics(steps: list) -> tuple:
+def _get_task_def(task_id: str, tasks_dir: Path) -> tuple:
+    """
+    Resolve task_id (e.g. summarization_0_run0, planning_4_run0) to (initial_intent, steps).
+    The number in task_id is task_id_global (across all types); convert to local index per type.
+    Returns (initial_intent, steps) or (None, None) if not found.
+    """
+    base = re.sub(r"_run\d+$", "", task_id)
+    parts = base.split("_")
+    if len(parts) < 2:
+        return None, None
+    task_type, idx_str = parts[0], parts[1]
+    try:
+        global_idx = int(idx_str)
+    except ValueError:
+        return None, None
+    # Task order in main(): (summarization, sum_tasks), (planning, plan_tasks); task_id_global increments across both
+    sum_path = tasks_dir / "summarization_tasks.json"
+    plan_path = tasks_dir / "planning_tasks.json"
+    n_sum = len(json.loads(sum_path.read_text(encoding="utf-8"))) if sum_path.exists() else 0
+    n_plan = len(json.loads(plan_path.read_text(encoding="utf-8"))) if plan_path.exists() else 0
+    if task_type == "summarization":
+        local_idx = global_idx
+        path = sum_path
+    elif task_type == "planning":
+        local_idx = global_idx - n_sum
+        path = plan_path
+    else:
+        path = tasks_dir / "{}_tasks.json".format(task_type)
+        local_idx = global_idx
+    if not path.exists() or local_idx < 0:
+        return None, None
+    task_list = json.loads(path.read_text(encoding="utf-8"))
+    if local_idx >= len(task_list):
+        return None, None
+    task = task_list[local_idx]
+    return task.get("initial_intent"), task.get("steps")
+
+
+def _task_metrics(steps: list, ids_key: str = "ids") -> tuple:
     """Compute mean IDS, max IDS for steps 1..N (excluding step 0)."""
-    ids_vals = []
+    vals = []
     for s in steps:
-        ids_val = s.get("ids")
-        if ids_val is not None and s.get("step", 0) > 0:
-            ids_vals.append(float(ids_val))
-    if not ids_vals:
+        v = s.get(ids_key)
+        if v is not None and s.get("step", 0) > 0:
+            vals.append(float(v))
+    if not vals:
         return 0.0, 0.0
-    return float(np.mean(ids_vals)), float(np.max(ids_vals))
+    return float(np.mean(vals)), float(np.max(vals))
 
 
 def _paired_ids_significance(task_rows: list) -> dict:
@@ -165,12 +209,12 @@ def interpret_results(
     baseline_path: Path = None,
     intent_path: Path = None,
     output_subdir: str = None,
+    legacy: bool = False,
 ) -> bool:
     """
-    Load baseline and intent logs, compare using IDS, generate tables, graphs, and report.
-    If baseline_path/intent_path are given, use those; else defaults to baseline_runs.jsonl and intent_runs.jsonl in logs_dir.
-    If output_subdir is given, write all outputs (CSV, PNG, report) to logs_dir / output_subdir; else write to logs_dir.
-    Returns True if interpretation succeeded, False if logs are missing/empty.
+    Load baseline and intent logs, compare using IDS (Intent Drift Score, primary) and goal_shift (task-level), generate tables, graphs, and report.
+    Uses intent_replay to get inferred goal per step, then compute_ids(output, inferred_goal) and compute_goal_shift(initial, final_goal).
+    If legacy=True, use old ids from logs when task def is missing (no intent_replay).
     """
     if baseline_path is None:
         baseline_path = logs_dir / "baseline_runs.jsonl"
@@ -179,6 +223,10 @@ def interpret_results(
     out_dir = (logs_dir / output_subdir) if output_subdir else logs_dir
     if output_subdir:
         out_dir.mkdir(parents=True, exist_ok=True)
+    tasks_dir = logs_dir.parent / "tasks"
+
+    from metrics.ids import compute_ids, compute_goal_shift
+    from metrics.intent_replay import intent_replay
 
     baseline_entries = _load_jsonl(baseline_path)
     intent_entries = _load_jsonl(intent_path)
@@ -195,27 +243,66 @@ def interpret_results(
         print("  [Interpret] Skipping: no overlapping task_ids between logs.")
         return False
 
-    # Per-task comparison
+    # Enrich step logs with IDS (from intent_replay + compute_ids) and task-level goal_shift
+    for tid in all_task_ids:
+        initial_intent, steps = _get_task_def(tid, tasks_dir)
+        if initial_intent is None or steps is None:
+            if legacy:
+                continue  # will use goal_shift from logs below for legacy
+            print("  [Interpret] Warning: no task def for {} (use --legacy for old logs).".format(tid))
+            continue
+        inferred = intent_replay(initial_intent, steps)
+        if not inferred:
+            continue
+        # IDS per step for baseline and intent (step t: compute_ids(output_t, inferred[t]["goal"]))
+        inferred_by_step = {r["step"]: r for r in inferred}
+        for s in baseline_by_task[tid]:
+            step_i = s.get("step", 0)
+            if step_i in inferred_by_step and "output" in s:
+                s["ids"] = round(compute_ids(s["output"], inferred_by_step[step_i]["goal"]), 4)
+        for s in intent_by_task[tid]:
+            step_i = s.get("step", 0)
+            if step_i in inferred_by_step and "output" in s:
+                s["ids"] = round(compute_ids(s["output"], inferred_by_step[step_i]["goal"]), 4)
+
+    # Per-task comparison: mean_ids, max_ids, goal_shift (task-level)
     task_rows = []
     for tid in all_task_ids:
         b_steps = baseline_by_task[tid]
         i_steps = intent_by_task[tid]
-        b_mean, b_max = _task_metrics(b_steps)
-        i_mean, i_max = _task_metrics(i_steps)
+        initial_intent, steps = _get_task_def(tid, tasks_dir)
+        if initial_intent is not None and steps is not None:
+            inferred = intent_replay(initial_intent, steps)
+            goal_shift_task = round(compute_goal_shift(initial_intent, inferred[-1]["goal"]), 4) if inferred else None
+        else:
+            goal_shift_task = None
+        if legacy and goal_shift_task is None:
+            # Legacy: use ids from logs if present (old schema had task-level in "ids")
+            goal_shift_task = i_steps[-1].get("ids") if i_steps else None
+        b_mean, b_max = _task_metrics(b_steps, "ids")
+        i_mean, i_max = _task_metrics(i_steps, "ids")
+        # If no IDS was computed (e.g. no task def), fall back to "usd" from logs for legacy
+        if b_mean == 0 and b_max == 0 and any(s.get("usd") is not None for s in b_steps):
+            b_mean, b_max = _task_metrics(b_steps, "usd")
+        if i_mean == 0 and i_max == 0 and any(s.get("usd") is not None for s in i_steps):
+            i_mean, i_max = _task_metrics(i_steps, "usd")
         delta_mean = i_mean - b_mean
         delta_max = i_max - b_max
         winner = "intent" if i_mean < b_mean else "baseline"
-        task_rows.append({
+        row = {
             "task_id": tid,
             "task_type": _task_type(tid),
             "baseline_mean_ids": round(b_mean, 4),
             "intent_mean_ids": round(i_mean, 4),
             "baseline_max_ids": round(b_max, 4),
             "intent_max_ids": round(i_max, 4),
-            "delta_mean": round(delta_mean, 4),
-            "delta_max": round(delta_max, 4),
+            "delta_ids": round(delta_mean, 4),
+            "delta_max_ids": round(delta_max, 4),
             "winner": winner,
-        })
+        }
+        if goal_shift_task is not None:
+            row["goal_shift"] = goal_shift_task
+        task_rows.append(row)
 
     # Aggregate stats
     intent_wins = sum(1 for r in task_rows if r["winner"] == "intent")
@@ -235,13 +322,18 @@ def interpret_results(
 
     # --- Write CSV tables ---
     task_csv = out_dir / "task_comparison.csv"
+    fieldnames = [
+        "task_id", "task_type", "baseline_mean_ids", "intent_mean_ids",
+        "baseline_max_ids", "intent_max_ids", "delta_ids", "delta_max_ids", "goal_shift", "winner"
+    ]
     with open(task_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "task_id", "task_type", "baseline_mean_ids", "intent_mean_ids",
-            "baseline_max_ids", "intent_max_ids", "delta_mean", "delta_max", "winner"
-        ])
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
-        w.writerows(task_rows)
+        for r in task_rows:
+            row = dict(r)
+            if "goal_shift" not in row:
+                row["goal_shift"] = ""
+            w.writerow(row)
 
     # Statistical significance (paired: same task, baseline vs intent)
     sig = _paired_ids_significance(task_rows)
@@ -292,12 +384,12 @@ def interpret_results(
     b_means = [np.mean(b_by_step[s]) if b_by_step[s] else 0 for s in steps_range]
     i_means = [np.mean(i_by_step[s]) if i_by_step[s] else 0 for s in steps_range]
 
-    # ids_by_step.png
+    # ids_by_step.png (primary metric)
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(steps_range, b_means, marker="o", label="Baseline", linewidth=2, markersize=6)
     ax.plot(steps_range, i_means, marker="s", label="Intent fusion", linewidth=2, markersize=6)
     ax.set_xlabel("Step")
-    ax.set_ylabel("Mean IDS")
+    ax.set_ylabel("Mean IDS (Intent Drift Score)")
     ax.set_title("Intent Drift Score by Step (mean across tasks)")
     ax.legend()
     ax.set_ylim(0, 1.05)
@@ -324,7 +416,7 @@ def interpret_results(
         ax.bar(x_pos + width / 2, i_vals, width, label="Intent fusion")
         ax.set_xticks(x_pos)
         ax.set_xticklabels(labels)
-        ax.set_ylabel("Mean IDS")
+        ax.set_ylabel("Mean IDS (Intent Drift Score)")
         ax.set_title("Mean IDS by Task Type")
         ax.legend()
         ax.set_ylim(0, 1.05)
@@ -349,7 +441,7 @@ def interpret_results(
             ax.bar(x_pos + width / 2, [r["intent_mean_ids"] for r in rows], width, label="Intent fusion")
             ax.set_xticks(x_pos)
             ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_ylabel("Mean IDS")
+            ax.set_ylabel("Mean IDS (Intent Drift Score)")
             ax.set_title("Mean IDS per Task ({})".format(task_type))
             ax.legend()
             ax.set_ylim(0, 1.05)
@@ -365,11 +457,13 @@ def interpret_results(
         "",
         "Generated: {}".format(ts),
         "",
-        "## Intent Drift Score (IDS)",
+        "## Primary metric: IDS (Intent Drift Score)",
         "",
-        "- **0** = aligned with initial intent",
-        "- **1** = maximum semantic drift",
-        "- Lower is better.",
+        "- Per-step divergence of output from current inferred goal. **0** = aligned, **1** = max drift. Lower is better.",
+        "",
+        "## Secondary metric: Goal shift",
+        "",
+        "- Task-level cumulative goal shift (initial vs final intent). Lower is better.",
         "",
         "## Summary",
         "",
@@ -398,20 +492,20 @@ def interpret_results(
         if sig.get("p_wilcoxon") is not None:
             report_lines.append("- **Wilcoxon signed-rank** (non-parametric): p = {:.4f}.".format(sig["p_wilcoxon"]))
         if sig.get("cohens_d") is not None:
-            report_lines.append("- **Cohen\'s d** (paired; negative = intent lower IDS): d = {:.3f}.".format(sig["cohens_d"]))
+            report_lines.append("- **Cohen's d** (paired; negative = intent lower IDS): d = {:.3f}.".format(sig["cohens_d"]))
         report_lines.append("- Interpret: p < 0.05 suggests the mean IDS difference is unlikely due to chance; |d| ~ 0.2 small, ~0.5 medium, ~0.8+ large.")
     report_lines.extend([
         "",
         "## Task-Level Comparison",
         "",
-        "| task_id | task_type | baseline_mean | intent_mean | delta | winner |",
-        "|---------|-----------|---------------|-------------|-------|--------|",
+        "| task_id | task_type | baseline_mean_ids | intent_mean_ids | delta_ids | winner |",
+        "|---------|-----------|-------------------|-----------------|-----------|---|",
     ])
     for r in task_rows:
         report_lines.append(
             "| {} | {} | {:.4f} | {:.4f} | {:+.4f} | {} |".format(
                 r["task_id"], r["task_type"], r["baseline_mean_ids"], r["intent_mean_ids"],
-                r["delta_mean"], r["winner"]
+                r["delta_ids"], r["winner"]
             )
         )
     report_lines.extend([
@@ -435,13 +529,13 @@ def interpret_results(
     return True
 
 
-def interpret_all_models(logs_dir: Path, models: list) -> bool:
+def interpret_all_models(logs_dir: Path, models: list, legacy: bool = False) -> bool:
     """
     Run interpretation for each model (per-model outputs in subdirs), then generate cross-model visualizations.
-    Returns True if at least one model had valid logs.
+    Returns True if at least one model had valid logs. legacy: use old ids from logs when task def missing.
     """
     slugs = [model_to_slug(m) for m in models]
-    per_model_results = []  # list of (slug, overall_b, overall_i, intent_wins, total, steps_range, b_means, i_means)
+    per_model_results = []  # list of (slug, overall_b, overall_i, intent_wins, total, steps_range, b_means, i_means, steps_sum, b_means_sum, i_means_sum, steps_plan, b_means_plan, i_means_plan)
 
     for slug in slugs:
         baseline_path = logs_dir / "baseline_runs_{}.jsonl".format(slug)
@@ -450,19 +544,42 @@ def interpret_all_models(logs_dir: Path, models: list) -> bool:
             print("  [Interpret] Skipping model {} (no logs).".format(slug))
             continue
         print("  [Interpret] Model: {} ...".format(slug))
-        ok = interpret_results(logs_dir, baseline_path=baseline_path, intent_path=intent_path, output_subdir=slug)
+        ok = interpret_results(logs_dir, baseline_path=baseline_path, intent_path=intent_path, output_subdir=slug, legacy=legacy)
         if ok:
-            # Load summary for cross-model (we need overall_b, overall_i; and for ids_by_step_all_models we need per-step means)
+            # Load and enrich with IDS for cross-model (same as interpret_results)
+            from metrics.ids import compute_ids
+            from metrics.intent_replay import intent_replay
+            tasks_dir = logs_dir.parent / "tasks"
             baseline_entries = _load_jsonl(baseline_path)
             intent_entries = _load_jsonl(intent_path)
             baseline_by_task = _group_by_task_id(baseline_entries)
             intent_by_task = _group_by_task_id(intent_entries)
             all_task_ids = sorted(set(baseline_by_task.keys()) & set(intent_by_task.keys()))
+            for tid in all_task_ids:
+                initial_intent, steps = _get_task_def(tid, tasks_dir)
+                if initial_intent is None or steps is None:
+                    continue
+                inferred = intent_replay(initial_intent, steps)
+                if not inferred:
+                    continue
+                inferred_by_step = {r["step"]: r for r in inferred}
+                for s in baseline_by_task[tid]:
+                    step_i = s.get("step", 0)
+                    if step_i in inferred_by_step and "output" in s:
+                        s["ids"] = round(compute_ids(s["output"], inferred_by_step[step_i]["goal"]), 4)
+                for s in intent_by_task[tid]:
+                    step_i = s.get("step", 0)
+                    if step_i in inferred_by_step and "output" in s:
+                        s["ids"] = round(compute_ids(s["output"], inferred_by_step[step_i]["goal"]), 4)
             if all_task_ids:
                 task_rows = []
                 for tid in all_task_ids:
-                    b_mean, b_max = _task_metrics(baseline_by_task[tid])
-                    i_mean, i_max = _task_metrics(intent_by_task[tid])
+                    b_mean, b_max = _task_metrics(baseline_by_task[tid], "ids")
+                    i_mean, i_max = _task_metrics(intent_by_task[tid], "ids")
+                    if b_mean == 0 and b_max == 0 and any(s.get("usd") is not None for s in baseline_by_task[tid]):
+                        b_mean, b_max = _task_metrics(baseline_by_task[tid], "usd")
+                    if i_mean == 0 and i_max == 0 and any(s.get("usd") is not None for s in intent_by_task[tid]):
+                        i_mean, i_max = _task_metrics(intent_by_task[tid], "usd")
                     task_rows.append({"baseline_mean_ids": b_mean, "intent_mean_ids": i_mean})
                 overall_b = float(np.mean([r["baseline_mean_ids"] for r in task_rows]))
                 overall_i = float(np.mean([r["intent_mean_ids"] for r in task_rows]))
@@ -480,13 +597,38 @@ def interpret_all_models(logs_dir: Path, models: list) -> bool:
                             i_by_step[step].append(float(ids_val))
                 b_means = [np.mean(b_by_step[s]) if b_by_step[s] else 0 for s in steps_range]
                 i_means = [np.mean(i_by_step[s]) if i_by_step[s] else 0 for s in steps_range]
-                per_model_results.append((slug, overall_b, overall_i, intent_wins, len(task_rows), steps_range, b_means, i_means))
+                # Per-task-type IDS by step (for ids_by_step_by_task_type.png)
+                sum_tids = [tid for tid in all_task_ids if _task_type(tid) == "summarization"]
+                plan_tids = [tid for tid in all_task_ids if _task_type(tid) == "planning"]
+                def _means_by_type(tids):
+                    if not tids:
+                        return list(steps_range), [0.0] * len(steps_range), [0.0] * len(steps_range)
+                    b_by_s = {s: [] for s in steps_range}
+                    i_by_s = {s: [] for s in steps_range}
+                    for tid in tids:
+                        for step, v in _ids_by_step(baseline_by_task[tid]):
+                            if step in b_by_s:
+                                b_by_s[step].append(float(v))
+                        for step, v in _ids_by_step(intent_by_task[tid]):
+                            if step in i_by_s:
+                                i_by_s[step].append(float(v))
+                    b_m = [np.mean(b_by_s[s]) if b_by_s[s] else np.nan for s in steps_range]
+                    i_m = [np.mean(i_by_s[s]) if i_by_s[s] else np.nan for s in steps_range]
+                    return steps_range, b_m, i_m
+                steps_sum, b_means_sum, i_means_sum = _means_by_type(sum_tids)
+                steps_plan, b_means_plan, i_means_plan = _means_by_type(plan_tids)
+                per_model_results.append((
+                    slug, overall_b, overall_i, intent_wins, len(task_rows),
+                    steps_range, b_means, i_means,
+                    steps_sum, b_means_sum, i_means_sum,
+                    steps_plan, b_means_plan, i_means_plan,
+                ))
 
     if not per_model_results:
         # Backward compatibility: try default log names (single-model run)
         if (logs_dir / "baseline_runs.jsonl").exists() and (logs_dir / "intent_runs.jsonl").exists():
             print("  [Interpret] Using default baseline_runs.jsonl / intent_runs.jsonl")
-            return interpret_results(logs_dir)
+            return interpret_results(logs_dir, legacy=legacy)
         return False
 
     # Cross-model visualizations
@@ -517,8 +659,8 @@ def _write_overall_experiment_report(logs_dir: Path, slugs: list):
                     continue
                 seen.add(key)
                 pooled_rows.append({
-                    "baseline_mean_ids": float(row.get("baseline_mean_ids", 0)),
-                    "intent_mean_ids": float(row.get("intent_mean_ids", 0)),
+                    "baseline_mean_ids": float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))),
+                    "intent_mean_ids": float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))),
                     "task_type": row.get("task_type", ""),
                     "task_id": "{} ({})".format(base, slug),
                 })
@@ -555,11 +697,12 @@ def _write_overall_experiment_report(logs_dir: Path, slugs: list):
         "",
         "Aggregates all models: {}.".format(", ".join(slugs)),
         "",
-        "## Intent Drift Score (IDS)",
+        "## Primary: IDS (Intent Drift Score)",
         "",
-        "- **0** = aligned with initial intent",
-        "- **1** = maximum semantic drift",
-        "- Lower is better.",
+        "- **0** = aligned with current goal",
+        "- **1** = maximum drift. Lower is better.",
+        "",
+        "## Secondary: Goal shift (task-level cumulative goal shift)",
         "",
         "## Summary",
         "",
@@ -615,6 +758,8 @@ def _write_overall_experiment_report(logs_dir: Path, slugs: list):
         "",
         "![IDS by Step (average across models)](ids_by_step_avg_models.png)",
         "",
+        "![IDS by Step by Task Type](ids_by_step_by_task_type.png)",
+        "",
     ])
 
     (logs_dir / "experiment_report.md").write_text("\n".join(report_lines), encoding="utf-8")
@@ -640,7 +785,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
     ax.bar(x + width / 2, overall_i, width, label="Intent fusion")
     ax.set_xticks(x)
     ax.set_xticklabels(slugs, rotation=45, ha="right")
-    ax.set_ylabel("Mean IDS")
+    ax.set_ylabel("Mean IDS (Intent Drift Score)")
     ax.set_title("Mean IDS by Model")
     ax.legend()
     ax.set_ylim(0, 1.05)
@@ -651,7 +796,8 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
 
     # ids_by_step_all_models.png: one line per model (intent fusion mean IDS by step)
     fig, ax = plt.subplots(figsize=(8, 5))
-    for slug, _, _, _, _, steps_range, b_means, i_means in per_model_results:
+    for r in per_model_results:
+        slug, steps_range, i_means = r[0], r[5], r[7]
         ax.plot(steps_range, i_means, marker="o", label="{} (intent)".format(slug), linewidth=1.5, markersize=4)
     ax.set_xlabel("Step")
     ax.set_ylabel("Mean IDS (Intent fusion)")
@@ -664,26 +810,50 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
     plt.close()
 
     # ids_by_step_avg_models.png: two lines — baseline (avg across models) and intent (avg across models)
-    max_step = max(s_range[-1] for _, _, _, _, _, s_range, _, _ in per_model_results)
+    max_step = max(r[5][-1] for r in per_model_results)
     steps_common = list(range(max_step + 1))
     avg_b = []
     avg_i = []
     for step in steps_common:
-        b_vals = [b_means[step] for _, _, _, _, _, s_range, b_means, i_means in per_model_results if step < len(s_range)]
-        i_vals = [i_means[step] for _, _, _, _, _, s_range, b_means, i_means in per_model_results if step < len(s_range)]
+        b_vals = [r[6][step] for r in per_model_results if step < len(r[5])]
+        i_vals = [r[7][step] for r in per_model_results if step < len(r[5])]
         avg_b.append(np.mean(b_vals) if b_vals else np.nan)
         avg_i.append(np.mean(i_vals) if i_vals else np.nan)
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(steps_common, avg_b, marker="o", label="Baseline (avg across models)", linewidth=2, markersize=6)
     ax.plot(steps_common, avg_i, marker="s", label="Intent fusion (avg across models)", linewidth=2, markersize=6)
     ax.set_xlabel("Step")
-    ax.set_ylabel("Mean IDS")
+    ax.set_ylabel("Mean IDS (Intent Drift Score)")
     ax.set_title("Intent Drift Score by Step (average across all models)")
     ax.legend()
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(logs_dir / "ids_by_step_avg_models.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # ids_by_step_by_task_type.png: IDS by step per model, split into summarization (left) and planning (right)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    for r in per_model_results:
+        slug = r[0]
+        steps_sum, i_means_sum = r[8], r[10]
+        steps_plan, i_means_plan = r[11], r[13]
+        axes[0].plot(steps_sum, i_means_sum, marker="o", label=slug, linewidth=1.5, markersize=4)
+        axes[1].plot(steps_plan, i_means_plan, marker="s", label=slug, linewidth=1.5, markersize=4)
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Mean IDS (Intent fusion)")
+    axes[0].set_title("Summarization — IDS by Step (per model)")
+    axes[0].legend()
+    axes[0].set_ylim(0, 1.05)
+    axes[0].grid(True, alpha=0.3)
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Mean IDS (Intent fusion)")
+    axes[1].set_title("Planning — IDS by Step (per model)")
+    axes[1].legend()
+    axes[1].set_ylim(0, 1.05)
+    axes[1].grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(logs_dir / "ids_by_step_by_task_type.png", dpi=150, bbox_inches="tight")
     plt.close()
 
     # ids_by_task_type_by_model.png: summarization vs planning, baseline vs intent, models kept separate (no averaging)
@@ -699,9 +869,9 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
             for row in reader:
                 scope = row.get("scope", "")
                 if scope == "summarization":
-                    model_sum[slug] = (float(row.get("baseline_mean_ids", 0)), float(row.get("intent_mean_ids", 0)))
+                    model_sum[slug] = (float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))), float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))))
                 elif scope == "planning":
-                    model_plan[slug] = (float(row.get("baseline_mean_ids", 0)), float(row.get("intent_mean_ids", 0)))
+                    model_plan[slug] = (float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))), float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))))
     if model_sum or model_plan:
         fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
         for idx, (task_type, data) in enumerate([("summarization", model_sum), ("planning", model_plan)]):
@@ -717,7 +887,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
             ax.bar(x_pos + width / 2, i_vals, width, label="Intent fusion")
             ax.set_xticks(x_pos)
             ax.set_xticklabels(model_slugs, rotation=45, ha="right")
-            ax.set_ylabel("Mean IDS")
+            ax.set_ylabel("Mean IDS (Intent Drift Score)")
             ax.set_title("{}".format(task_type.capitalize()))
             ax.legend()
             ax.set_ylim(0, 1.05)
@@ -742,11 +912,11 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
             for row in reader:
                 scope = row.get("scope", "")
                 if scope == "summarization":
-                    sum_b_vals.append(float(row.get("baseline_mean_ids", 0)))
-                    sum_i_vals.append(float(row.get("intent_mean_ids", 0)))
+                    sum_b_vals.append(float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))))
+                    sum_i_vals.append(float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))))
                 elif scope == "planning":
-                    plan_b_vals.append(float(row.get("baseline_mean_ids", 0)))
-                    plan_i_vals.append(float(row.get("intent_mean_ids", 0)))
+                    plan_b_vals.append(float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))))
+                    plan_i_vals.append(float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))))
     types_vals = []
     if sum_b_vals:
         types_vals.append(("summarization", np.mean(sum_b_vals), np.mean(sum_i_vals)))
@@ -763,7 +933,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
         ax.bar(x_pos + width / 2, i_vals, width, label="Intent fusion")
         ax.set_xticks(x_pos)
         ax.set_xticklabels(labels)
-        ax.set_ylabel("Mean IDS")
+        ax.set_ylabel("Mean IDS (Intent Drift Score)")
         ax.set_title("Mean IDS by Task Type (average across all models)")
         ax.legend()
         ax.set_ylim(0, 1.05)
@@ -772,7 +942,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
         fig.savefig(logs_dir / "ids_by_task_type_all_models.png", dpi=150, bbox_inches="tight")
         plt.close()
 
-    # ids_per_task_avg_models.png: mean IDS per task (summarization_0, 1, 2, 3, planning_4, ...), averaged across all models
+    # ids_per_task_avg_models.png: mean IDS per task, averaged across all models
     # Collect per-task data from each model's task_comparison.csv; dedupe by base task; average across models
     task_to_b = {}  # base_task -> [baseline_mean_ids from each model]
     task_to_i = {}
@@ -794,8 +964,8 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
                     task_to_b[base] = []
                     task_to_i[base] = []
                     task_to_type[base] = row.get("task_type", "")
-                task_to_b[base].append(float(row.get("baseline_mean_ids", 0)))
-                task_to_i[base].append(float(row.get("intent_mean_ids", 0)))
+                task_to_b[base].append(float(row.get("baseline_mean_ids", row.get("baseline_mean_usd", 0))))
+                task_to_i[base].append(float(row.get("intent_mean_ids", row.get("intent_mean_usd", 0))))
     # Build rows: (base_task, task_type, mean_b, mean_i), grouped by task_type for subplots
     per_task_avg = []
     for base in sorted(task_to_b.keys(), key=lambda x: (task_to_type.get(x, ""), x)):
@@ -822,7 +992,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
             ax.bar(x_pos + width / 2, [r["intent_mean"] for r in rows], width, label="Intent fusion")
             ax.set_xticks(x_pos)
             ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_ylabel("Mean IDS")
+            ax.set_ylabel("Mean IDS (Intent Drift Score)")
             ax.set_title("Mean IDS per Task ({}) — average across all models".format(task_type))
             ax.legend()
             ax.set_ylim(0, 1.05)
@@ -841,7 +1011,7 @@ def _write_cross_model_visualizations(logs_dir: Path, per_model_results: list):
     # Overall experiment report (aggregates all models, includes overall p-value)
     slugs = [r[0] for r in per_model_results]
     _write_overall_experiment_report(logs_dir, slugs)
-    print("  Cross-model: ids_by_model.png, ids_by_task_type_by_model.png, ids_by_task_type_all_models.png, ids_per_task_avg_models.png, ids_by_step_all_models.png, ids_by_step_avg_models.png, cross_model_summary.csv")
+    print("  Cross-model: ids_by_model.png, ids_by_step_by_task_type.png, ids_by_task_type_by_model.png, ids_by_task_type_all_models.png, ids_per_task_avg_models.png, ids_by_step_all_models.png, ids_by_step_avg_models.png, cross_model_summary.csv")
 
 
 def main(models_override: list = None):
@@ -856,20 +1026,10 @@ def main(models_override: list = None):
     print("[2/5] Preparing logs directory: {}".format(LOGS_DIR))
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    def model_has_logs(slug):
+    def model_has_both_logs(slug):
         return (LOGS_DIR / "baseline_runs_{}.jsonl".format(slug)).exists() and (
             LOGS_DIR / "intent_runs_{}.jsonl".format(slug)
         ).exists()
-
-    for model in models_to_run:
-        slug = model_to_slug(model)
-        if model_has_logs(slug):
-            continue
-        for name in ("baseline_runs_{}.jsonl", "intent_runs_{}.jsonl"):
-            p = LOGS_DIR / name.format(slug)
-            if p.exists():
-                p.write_text("")
-    print("      Cleared previous run logs for models that will be run (kept existing logs for others).")
 
     print("[3/5] Loading prompts and tasks...")
     system_prompt_baseline = load_prompt("agent_base.txt")
@@ -894,67 +1054,74 @@ def main(models_override: list = None):
 
     runs_list = list(iter_baseline_runs())
 
+    import gc
     for model in models_to_run:
         slug = model_to_slug(model)
-        if model_has_logs(slug):
-            print("\n[4/5] Model: {} (slug: {}) — skipping (log files already exist).".format(model.split("/")[-1], slug))
-            continue
+        baseline_path = LOGS_DIR / "baseline_runs_{}.jsonl".format(slug)
+        intent_path = LOGS_DIR / "intent_runs_{}.jsonl".format(slug)
         baseline_log = "baseline_runs_{}.jsonl".format(slug)
         intent_log = "intent_runs_{}.jsonl".format(slug)
+        if model_has_both_logs(slug):
+            print("\n[4/5] Model: {} (slug: {}) — skipping (both log files already exist).".format(model.split("/")[-1], slug))
+            continue
         print("\n[4/5] Model: {} (slug: {})".format(model.split("/")[-1], slug))
         from agents.baseline_agent import BaselineAgent
         from agents.intent_agent import IntentAgent
 
-        baseline_agent = BaselineAgent(log_dir=str(LOGS_DIR), model_name=model, seed=SEED)
-        intent_agent = IntentAgent(log_dir=str(LOGS_DIR), model_name=model, seed=SEED)
+        baseline_agent = None
+        intent_agent = None
 
-        print("--- Baseline agent (no intent fusion) ---")
-        for task_type, task_id_global, task, run in tqdm(runs_list, desc="Baseline runs", unit="run"):
-            task_id = "{}_{}_run{}".format(task_type, task_id_global, run)
-            run_seed = SEEDS[run]
-            set_global_seed(run_seed)
-            initial_context = task.get("article") or task.get("context") or ""
-            baseline_agent.run_and_log(
-                task_id=task_id,
-                initial_intent=task["initial_intent"],
-                steps=task["steps"],
-                system_prompt=system_prompt_baseline,
-                initial_context=initial_context,
-                log_file=baseline_log,
-                verbose=False,
-                seed=run_seed,
-            )
+        if not baseline_path.exists():
+            print("--- Baseline agent (no intent fusion) ---")
+            baseline_agent = BaselineAgent(log_dir=str(LOGS_DIR), model_name=model, seed=SEED)
+            for task_type, task_id_global, task, run in tqdm(runs_list, desc="Baseline runs", unit="run"):
+                task_id = "{}_{}_run{}".format(task_type, task_id_global, run)
+                run_seed = SEEDS[run]
+                set_global_seed(run_seed)
+                initial_context = task.get("article") or task.get("context") or ""
+                baseline_agent.run_and_log(
+                    task_id=task_id,
+                    initial_intent=task["initial_intent"],
+                    steps=task["steps"],
+                    system_prompt=system_prompt_baseline,
+                    initial_context=initial_context,
+                    log_file=baseline_log,
+                    verbose=False,
+                    seed=run_seed,
+                )
+            print("\n--- Freeing baseline model from GPU ---")
+            baseline_agent._model = None
+            baseline_agent._tokenizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print("--- Baseline: skipping (log already exists: {}) ---".format(baseline_path.name))
 
-        print("\n--- Freeing baseline model from GPU ---")
-        baseline_agent._model = None
-        baseline_agent._tokenizer = None
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print("\n--- Intent fusion agent (Intent object sent every time) ---")
-        for task_type, task_id_global, task, run in tqdm(runs_list, desc="Intent fusion runs", unit="run"):
-            task_id = "{}_{}_run{}".format(task_type, task_id_global, run)
-            run_seed = SEEDS[run]
-            set_global_seed(run_seed)
-            initial_context = task.get("article") or task.get("context") or ""
-            intent_agent.run_and_log(
-                task_id=task_id,
-                initial_intent=task["initial_intent"],
-                steps=task["steps"],
-                initial_context=initial_context,
-                log_file=intent_log,
-                verbose=False,
-                seed=run_seed,
-            )
-
-        # Free intent model before loading next model
-        intent_agent._model = None
-        intent_agent._tokenizer = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if not intent_path.exists():
+            print("\n--- Intent fusion agent (Intent object sent every time) ---")
+            intent_agent = IntentAgent(log_dir=str(LOGS_DIR), model_name=model, seed=SEED)
+            for task_type, task_id_global, task, run in tqdm(runs_list, desc="Intent fusion runs", unit="run"):
+                task_id = "{}_{}_run{}".format(task_type, task_id_global, run)
+                run_seed = SEEDS[run]
+                set_global_seed(run_seed)
+                initial_context = task.get("article") or task.get("context") or ""
+                intent_agent.run_and_log(
+                    task_id=task_id,
+                    initial_intent=task["initial_intent"],
+                    steps=task["steps"],
+                    initial_context=initial_context,
+                    log_file=intent_log,
+                    verbose=False,
+                    seed=run_seed,
+                )
+            intent_agent._model = None
+            intent_agent._tokenizer = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print("\n--- Intent: skipping (log already exists: {}) ---".format(intent_path.name))
 
     print("\n[5/5] Interpretation (per model and cross-model)...")
     interpret_all_models(LOGS_DIR, models_to_run)
@@ -965,16 +1132,25 @@ def main(models_override: list = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Intent Drift Experiment")
+    parser = argparse.ArgumentParser(
+        description="Intent Drift Experiment",
+        epilog="Examples:  --model meta-llama/Llama-3.1-8B-Instruct   (one model)   --models model1,model2   (multiple)",
+    )
     parser.add_argument("--interpret-only", action="store_true",
                         help="Skip experiment; only regenerate interpretation from existing logs")
+    parser.add_argument("--legacy", action="store_true",
+                        help="Use for old logs that only have ids (no intent_replay; IDS skipped or from step ids)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Run with a single model (e.g. meta-llama/Llama-3.1-8B-Instruct or google/gemma-2-2b-it)")
     parser.add_argument("--models", type=str, default=None,
-                        help="Comma-separated model names to run (default: built-in MODELS list)")
+                        help="Comma-separated model names (overrides --model if both given; default: built-in MODELS list)")
     args = parser.parse_args()
 
     models_override = None
     if args.models:
         models_override = [m.strip() for m in args.models.split(",") if m.strip()]
+    elif args.model:
+        models_override = [args.model.strip()]
 
     if args.interpret_only:
         print("=" * 60)
@@ -982,7 +1158,7 @@ if __name__ == "__main__":
         print("=" * 60)
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         models_for_interpret = models_override if models_override is not None else MODELS
-        if interpret_all_models(LOGS_DIR, models_for_interpret):
+        if interpret_all_models(LOGS_DIR, models_for_interpret, legacy=args.legacy):
             print("\nInterpretation complete.")
         else:
             print("\nNo logs found. Run the full experiment first.")

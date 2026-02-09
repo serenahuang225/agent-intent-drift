@@ -9,11 +9,7 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List
 
-# For IDS in logs (same as intent_fusion so we can plot IDS vs step for both)
-try:
-    from metrics.ids import compute_ids
-except ImportError:
-    compute_ids = None
+# IDS and goal_shift are computed at interpretation time via intent_replay; no runtime metric here.
 
 # Llama-3.1-8B-Instruct: instruction-tuned, runs on CUDA (gated; use HF_TOKEN or huggingface-cli login)
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
@@ -318,7 +314,6 @@ class BaselineAgent:
             "step": 0,
             "prompt": first_instruction,
             "output": initial_output,
-            "ids": 0.0,
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
@@ -332,18 +327,14 @@ class BaselineAgent:
                 step_label="  step {}/{} ...".format(i, num_steps) if verbose else "",
                 seed=seed,
             )
-            ids_t = round(compute_ids(initial_output, out), 4) if compute_ids else None
-            log_entry = {
+            step_logs.append({
                 "agent": "baseline",
                 "task_id": task_id,
                 "step": i,
                 "prompt": step_instruction,
                 "output": out,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
-            }
-            if ids_t is not None:
-                log_entry["ids"] = ids_t
-            step_logs.append(log_entry)
+            })
 
         if verbose:
             print("  [Baseline] Task {} done.".format(task_id))

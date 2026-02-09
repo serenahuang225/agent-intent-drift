@@ -1,0 +1,4 @@
+model_slug,baseline_mean_ids,intent_mean_ids,intent_wins,total_tasks
+llama-3.1-8b-instruct,0.4325,0.3608,24,24
+gemma-2-2b-it,0.4656,0.4371,15,24
+mistral-7b-instruct-v0.2,0.5403,0.5091,9,12

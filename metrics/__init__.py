@@ -1,1 +1,1 @@
-from .ids import compute_ids, embedding, cosine_similarity
+from .ids import compute_ids, compute_goal_shift, embedding, cosine_similarity

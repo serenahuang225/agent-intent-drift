@@ -37,7 +37,7 @@ flowchart TB
         ELAB_OR_CONFLICT -->|No| CONFLICT["Keep intent + conflict_handling"]
         ELAB --> BASELINE_STEP
         CONFLICT --> BASELINE_STEP
-        INTENT_STEP --> COMPUTE_IDS["compute_ids()\n1 - cosine_sim(init_output, current_output)"]
+        INTENT_STEP --> COMPUTE_IDS["compute_ids()\n1 - cosine_sim(output, current_goal)"]
         INTENT_AGENT --> INTENT_LOG["Append to intent_runs_{slug}.jsonl"]
     end
 
@@ -84,7 +84,7 @@ flowchart TB
 
     subgraph DEPENDENCIES["Dependencies"]
         INTENT_PY
-        METRICS_MOD["metrics/ids.py\n(embedding, compute_ids)"]
+        METRICS_MOD["metrics/ids.py\n(embedding, compute_ids, compute_goal_shift)"]
         BASELINE_MOD["agents/baseline_agent.py"]
         INTENT_MOD["agents/intent_agent.py"]
     end

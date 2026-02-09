@@ -1,14 +1,14 @@
 """
 Intent Fusion Agent: uses Intent as a first-class object (single source of truth).
 The full Intent is sent to the model every time. At each step: check instruction vs intent;
-update intent if allowed; log IDS.
+update intent via with_goal_replacement when sim is low; log update_type (USD computed at interpretation).
 """
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from metrics.ids import compute_ids, embedding, cosine_similarity
+from metrics.ids import embedding, cosine_similarity
 
 from .baseline_agent import (
     DEFAULT_MODEL,
@@ -20,10 +20,11 @@ from .baseline_agent import (
 # Intent is first-class; when run from intent_drift_experiment, "intent" resolves to ./intent.py
 from intent import Intent, intent_factory
 
-# Similarity thresholds for controlled expansion (dynamic intent updating)
-LOW_THRESHOLD = 0.30  # Below: conflicting drift (e.g. "turn the plan into a poem") — keep intent, apply constraints
-HIGH_THRESHOLD = 0.75  # Above: valid elaboration — update intent to include it
-# Between LOW and HIGH: treat as elaboration too — sub-tasks often have moderate similarity to goal
+# Similarity thresholds: sim > HIGH → keep; sim < LOW → major shift; else high_drift_risk (update + log)
+HIGH_THRESHOLD = 0.8
+LOW_THRESHOLD = 0.6
+
+UpdateType = Literal["refinement", "major_shift", "high_drift_risk"]
 
 
 def _load_intent_prompt_template() -> str:
@@ -32,10 +33,10 @@ def _load_intent_prompt_template() -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def intent_prompt_with_object(intent: Intent, conflict_handling: str = "") -> str:
-    """Build system prompt with the full Intent object (sent every single time)."""
+def intent_prompt_with_object(intent: Intent) -> str:
+    """Build system prompt with the full Intent object (sent every single time). No conflict_handling."""
     template = _load_intent_prompt_template()
-    return template.format(intent_block=intent.to_prompt_block(), conflict_handling=conflict_handling or "")
+    return template.format(intent_block=intent.to_prompt_block())
 
 
 def run_intent_step(
@@ -44,48 +45,62 @@ def run_intent_step(
     intent: Intent,
     conversation: list[dict],
     user_message: str,
-    initial_output: str,
     max_new_tokens: int = 256,
     seed: int = SEED,
-) -> tuple[str, Intent, bool, bool]:
+) -> tuple[str, Intent, UpdateType]:
     """
-    Run one step with controlled expansion (dynamic intent updating).
-    Returns (response, next_intent, conflict_would_trigger, intent_elaborated).
+    Run one step with inverted intent engine.
+    Returns (response, next_intent, update_type).
 
-    - similarity > HIGH_THRESHOLD: valid elaboration (e.g. "add risk assessment") — update intent
-      so the agent can incorporate it; generate with expanded intent.
-    - similarity < LOW_THRESHOLD: conflicting drift — keep intent unchanged, apply constraints.
-    - else: ambiguous — keep intent unchanged, use constrained generation.
+    - sim > 0.8: Refinement. Keep intent, no update.
+    - sim < 0.6: Major goal shift. with_goal_replacement(instruction), reason "major_shift".
+    - 0.6 <= sim <= 0.8: Ambiguous. with_goal_replacement(instruction), reason "high_drift_risk".
+    Always send current intent to the model (no blocking).
     """
     from transformers import set_seed
     set_seed(seed)
 
-    proposed = user_message
-    emb_orig = embedding(intent.goal)
-    emb_proposed = embedding(proposed)
-    sim = cosine_similarity(emb_orig, emb_proposed)
+    instruction = user_message
+    emb_goal = embedding(intent.goal)
+    emb_inst = embedding(instruction)
+    sim = cosine_similarity(emb_goal, emb_inst)
 
-    if sim >= LOW_THRESHOLD:
-        # Valid elaboration (includes ambiguous zone): update intent so agent can incorporate this instruction
-        next_intent = intent.with_elaboration(proposed)
-        conflict_would_trigger = False
-        intent_elaborated = True
-    else:
-        # Conflicting drift (sim < LOW): keep current intent, add format-flexibility note
+    if sim > HIGH_THRESHOLD:
+        update_type: UpdateType = "refinement"
         next_intent = intent
-        conflict_would_trigger = True
-        intent_elaborated = False
+    elif sim < LOW_THRESHOLD:
+        update_type = "major_shift"
+        next_intent = intent.with_goal_replacement(
+            instruction,
+            update_history_append={
+                "old_goal": intent.goal,
+                "new_goal": instruction,
+                "reason": "major_shift",
+            },
+        )
+    else:
+        update_type = "high_drift_risk"
+        # Elaborate rather than replace: keep previous focus and add this step (reduces losing user's thread)
+        next_intent = intent.with_elaboration(instruction)
+        next_intent = Intent(
+            intent_id=next_intent.intent_id,
+            goal=next_intent.goal,
+            constraints=next_intent.constraints,
+            success_criteria=next_intent.success_criteria,
+            assumptions=next_intent.assumptions,
+            confidence=next_intent.confidence,
+            last_confirmed=next_intent.last_confirmed,
+            version=next_intent.version,
+            update_history=next_intent.update_history
+            + [{"old_goal": intent.goal, "new_goal": next_intent.goal, "reason": "high_drift_risk"}],
+            overall_goal=next_intent.overall_goal,
+        )
 
-    conflict_note = (
-        "\n\n**IMPORTANT:** The instruction below may request a different format (e.g. bullets, "
-        "table, timeline, two sentences). Follow that format while staying aligned with the "
-        "overall goal. Do not refuse the request."
-    ) if conflict_would_trigger else ""
-    system_prompt = intent_prompt_with_object(next_intent, conflict_handling=conflict_note)
+    system_prompt = intent_prompt_with_object(next_intent)
     response = run_baseline_step(
         model, tokenizer, system_prompt, conversation, user_message, max_new_tokens, seed=seed
     )
-    return response, next_intent, conflict_would_trigger, intent_elaborated
+    return response, next_intent, update_type
 
 
 class IntentAgent:
@@ -118,14 +133,14 @@ class IntentAgent:
         verbose: bool = True,
         seed: int = SEED,
     ) -> list[dict[str, Any]]:
-        """Run full task with Intent object; compute IDS at every step. initial_context = article/source when present."""
+        """Run full task with Intent object; log update_type and update_history (USD computed at interpretation)."""
         self._ensure_model()
         conversation: list[dict[str, str]] = []
         intent = intent_factory(initial_intent)
         step_logs = []
         num_steps = len(steps) if steps else 1
         if verbose:
-            print("  [Intent] Task {}: {} steps (computing IDS per step)".format(task_id, num_steps))
+            print("  [Intent] Task {}: {} steps".format(task_id, num_steps))
 
         first_instruction = steps[0] if steps else initial_intent
         if initial_context and first_instruction:
@@ -149,7 +164,6 @@ class IntentAgent:
             first_user_msg,
             seed=seed,
         )
-        ids_0 = 0.0
         step_logs.append({
             "agent": "intent_fusion",
             "task_id": task_id,
@@ -158,24 +172,23 @@ class IntentAgent:
             "intent_id": intent.intent_id,
             "intent_version": intent.version,
             "intent_goal": intent.goal,
+            "update_type": "initial",
+            "update_history": list(intent.update_history),
             "prompt": first_instruction,
             "output": initial_output,
-            "ids": ids_0,
         })
 
         for i, step_instruction in enumerate(steps[1:], start=1):
             if verbose:
-                print("  step {}/{} (IDS) ...".format(i, num_steps))
-            response, intent, conflict, elaborated = run_intent_step(
+                print("  step {}/{} ...".format(i, num_steps))
+            response, intent, update_type = run_intent_step(
                 self._model,
                 self._tokenizer,
                 intent,
                 conversation,
                 step_instruction,
-                initial_output,
                 seed=seed,
             )
-            ids_t = compute_ids(initial_output, response)
             step_logs.append({
                 "agent": "intent_fusion",
                 "task_id": task_id,
@@ -184,11 +197,10 @@ class IntentAgent:
                 "intent_id": intent.intent_id,
                 "intent_version": intent.version,
                 "intent_goal": intent.goal,
+                "update_type": update_type,
+                "update_history": list(intent.update_history),
                 "prompt": step_instruction,
                 "output": response,
-                "ids": round(ids_t, 4),
-                "conflict_would_trigger": conflict,
-                "intent_elaborated": elaborated,
             })
 
         if verbose:

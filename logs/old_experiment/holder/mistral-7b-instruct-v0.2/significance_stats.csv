@@ -1,0 +1,5 @@
+stat,value
+n_tasks,24
+p_ttest_paired,5.747962788365119e-07
+p_wilcoxon_paired,5.328655242919922e-05
+cohens_d_paired,-1.3946

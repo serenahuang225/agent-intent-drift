@@ -1,0 +1,4 @@
+scope,baseline_mean_usd,intent_mean_usd,intent_wins,total_tasks
+overall,0.4482,0.3744,18,24
+summarization,0.5404,0.4283,12,12
+planning,0.3561,0.3205,6,12

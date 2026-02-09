@@ -4,7 +4,7 @@ Sent every time to the agent; not implicit in prompts or history.
 """
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +23,8 @@ class Intent:
     confidence: float  # 0.0–1.0
     last_confirmed: str  # ISO timestamp
     version: int = 1
+    update_history: List[Dict[str, Any]] = field(default_factory=list)
+    overall_goal: Optional[str] = None  # Task-level goal (never replaced); keeps agent aligned to user's big picture
 
     def __post_init__(self):
         if not 0.0 <= self.confidence <= 1.0:
@@ -38,18 +40,25 @@ class Intent:
             "confidence": self.confidence,
             "last_confirmed": self.last_confirmed,
             "version": self.version,
+            "update_history": list(self.update_history),
+            "overall_goal": self.overall_goal,
         }
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
 
     def to_prompt_block(self) -> str:
-        """Format intent as a non-ignorable command within the system prompt."""
-        prompt_lines = [
-            "### ACTIVE USER INTENT (You MUST follow this) ###",
-            "**Primary Goal:** " + self.goal,
-            "**Version:** " + str(self.version),
-        ]
+        """Format intent as a non-ignorable command within the system prompt.
+        When overall_goal is set, show both the task-level goal and the current step so the agent keeps both in mind.
+        """
+        prompt_lines = ["### ACTIVE USER INTENT (You MUST follow this) ###"]
+        if self.overall_goal and self.overall_goal.strip() and self.overall_goal.strip() != self.goal.strip():
+            prompt_lines.append("**Overall task (do not lose sight of):** " + self.overall_goal.strip())
+            prompt_lines.append("**Current step / focus:** " + self.goal)
+        else:
+            prompt_lines.append("**Primary Goal:** " + self.goal)
+        prompt_lines.append("**This turn:** Your response must directly address and satisfy the current step above; stay focused and avoid generic or off-topic content.")
+        prompt_lines.append("**Version:** " + str(self.version))
         if self.constraints:
             prompt_lines.append("**Constraints:** " + "; ".join("'{}'".format(c) for c in self.constraints))
         if self.success_criteria:
@@ -58,7 +67,7 @@ class Intent:
             prompt_lines.append("**Assumptions:** " + "; ".join(self.assumptions))
 
         prompt_lines.append(
-            "\n**INSTRUCTION:** Before finalizing your response, YOU MUST explicitly verify it aligns with the Primary Goal and all Constraints above."
+            "\n**INSTRUCTION:** Before finalizing your response, YOU MUST explicitly verify it aligns with the Primary Goal (and overall task if shown) and all Constraints above."
         )
         return "\n".join(prompt_lines)
 
@@ -73,6 +82,34 @@ class Intent:
             confidence=self.confidence,
             last_confirmed=datetime.now(timezone.utc).isoformat() if bump_version else self.last_confirmed,
             version=(self.version + 1) if bump_version else self.version,
+            update_history=list(self.update_history),
+            overall_goal=self.overall_goal,
+        )
+
+    def with_goal_replacement(
+        self,
+        new_goal: str,
+        update_history_append: Optional[Dict[str, Any]] = None,
+    ) -> "Intent":
+        """
+        Replace goal and re-derive constraints/success_criteria. Used for major goal shifts.
+        Bumps version. Optionally append an entry to update_history (e.g. step, old_goal, new_goal, reason).
+        """
+        constraints, success_criteria = derive_constraints_from_goal(new_goal)
+        new_history = list(self.update_history)
+        if update_history_append is not None:
+            new_history = new_history + [update_history_append]
+        return Intent(
+            intent_id=self.intent_id,
+            goal=new_goal.strip(),
+            constraints=constraints,
+            success_criteria=success_criteria,
+            assumptions=self.assumptions,
+            confidence=self.confidence,
+            last_confirmed=datetime.now(timezone.utc).isoformat(),
+            version=self.version + 1,
+            update_history=new_history,
+            overall_goal=self.overall_goal,
         )
 
     def with_elaboration(self, new_instruction: str) -> "Intent":
@@ -153,6 +190,7 @@ def intent_factory(
     confidence: float = 1.0,
     version: int = 1,
     derive_from_goal: bool = True,
+    update_history: Optional[List[Dict[str, Any]]] = None,
 ) -> Intent:
     """Create an Intent (single source of truth) from a goal and optional fields.
     When constraints and success_criteria are not provided and derive_from_goal is True,
@@ -174,6 +212,8 @@ def intent_factory(
         confidence=confidence,
         last_confirmed=now,
         version=version,
+        update_history=update_history or [],
+        overall_goal=goal,  # Initial goal is the task-level goal we keep in mind
     )
 
 
@@ -188,4 +228,6 @@ def intent_from_dict(data: Dict[str, Any]) -> Intent:
         confidence=float(data.get("confidence", 1.0)),
         last_confirmed=data["last_confirmed"],
         version=int(data.get("version", 1)),
+        update_history=data.get("update_history", []),
+        overall_goal=data.get("overall_goal"),
     )
